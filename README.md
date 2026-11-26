@@ -152,6 +152,94 @@ with pool.borrow_snapshot_group(2, timeout=1) as readers:
 布尔值、非整数、越界或未知租户一律 `ValueError`，且在任何数据库改动
 之前抛出；SQLite/池错误不归入输入错误。
 
+## 批次最大化派发（`dispatch.py`）
+
+`dispatch_wave(pool, workers, *, before_commit=None)` 接收一轮最多 16 个执行器
+名额，先在库外求本轮最大合法匹配，再用一个 SQLite 写事务提交。它只处理初次
+派发：候选来自 `dispatch_ready`，成功后插入 `state='dispatched'`、`fence=1`
+的 `job_attempts` 记录，不接管旧尝试或对账后的重试。
+
+### 调用方式
+
+调用方先建好 WAL 库中的 `quota_tenants`、`quota_holds`、`job_attempts`、
+`dispatch_ready`，并完成 `ReservationIndex(pool).initialize()`。随后可重复
+调用 `initialize_dispatch(pool)`；它使用 `CREATE TABLE IF NOT EXISTS` 保证
+`dispatch_ready` 可用，不清候选，也不改业务行。
+
+```python
+from dispatch import dispatch_wave, initialize_dispatch
+
+initialize_dispatch(pool)
+
+workers = [
+    # (worker_id, epoch, kinds)；worker_id 本轮唯一
+    (101, 42, [1, 2]),
+    (102, 42, [1]),
+]
+
+def before_commit():
+    # 此处不持有 dispatch 的池借用或数据库事务；可以用同一个池写在线变更。
+    ...
+
+status, pairs = dispatch_wave(
+    pool, workers, before_commit=before_commit)
+
+# 成功：status == "committed"
+# pairs == [(job_id, worker_id), ...]，按 job_id 递增
+# 决策视图已被在线提交改变：("stale", [])，调用方应另起一轮
+```
+
+每个名额为 `(worker_id, epoch, kinds)`：`worker_id`、`epoch` 均为
+1..2147483647 的严格整数（不接受布尔值），`worker_id` 本轮不可重复；
+`kinds` 为 1..32 个不重复的 1..32 整数。名额由调用方独占，跨调用的重叠
+名额也由调用方禁止；它们不是 `quota_holds` 中的配额。
+
+### 选择规则
+
+只有同时满足以下条件的候选才参与匹配：
+
+1. `kind` 属于本轮至少一个执行器支持的种类；
+2. `(tenant_id, slot)` 在一致性视图中没有正单位的 `quota_holds` 占用（现有
+   配额入口在 units=0 时删行，因此正常数据即不存在该行）；
+3. 租户的 `quota_index.ready=1`；
+4. 租户当前精确余量 `max(0, max_units - used_units)` 大于 0。
+
+匹配约束为：每个执行器至多一个作业、每个作业至多派发一次、同一租户本批
+启动数不超过其精确余量。先最大化启动总数；若多个分配数量相同，把分配写成
+按 `job_id` 递增的 `(job_id, worker_id)` 序列，取字典序最小者。候选物理
+顺序和 `workers` 入参顺序均不影响结果。
+
+求解是纯内存最小费用流：最多 512 个候选、16 个执行器和 64 个租户。字典序
+通过按 `(job_id, worker_id)` 排序的层级权重编码，不在数据库借用内运行。
+
+### 两次借用与 stale
+
+一轮最多借用池两次：
+
+1. **读取决策输入。** 在一个 `BEGIN` 一致性 WAL 读事务中读取本轮支持种类
+   的全部 `dispatch_ready` 行、这些候选号位的 `quota_holds.units`，以及相关
+   租户的配额/回填状态；读取后立即 rollback 并归还连接。随后才在池外求解，
+   慢求解期间不持有连接，也不阻塞其他调度写入。
+2. **复核并提交。** 若提供 `before_commit`，在匹配完成且没有任何借用/事务
+   时调用一次（空批也调用，回调无参数）。回调可以用容量为 1 的同一个普通
+   池借用并提交；回调异常原样传播，dispatch 不进入提交。之后重新借用并
+   `BEGIN IMMEDIATE`，重新读取同一决策视图并与快照相比较。
+
+   - 视图有任何相关变化：返回 `("stale", [])`，不内部重算，也不改候选、
+     占用、配额总量或尝试。不能只复核入选者：新插入的可匹配作业也可能改变
+     字典序最优分配。
+   - 视图相同：在同一事务中逐作业删除 `dispatch_ready`、向
+     `quota_holds` 插入该号位的 1 单位占用、将对应
+     `quota_index.used_units` 加 1，并插入使用获选执行器 `epoch` 的尝试。
+   - 只增删改本轮不支持种类的候选，且占用变化只发生在初始视图未涉及的租户
+     时，快照仍相同，不会误判 stale。最终已回滚的写入不会改变快照，也不会
+     使批次过期。
+
+提交途中发生 SQLite 错误时回滚整个写事务并原样抛出错误，不会包装成
+`stale`，也不会撤销回调或其他调用方此前已经提交的事务。普通 WAL 池和
+`snapshot_groups=True` 的池都使用同一组 `pool.borrow()` 写资格；旧读组仍可
+继续读旧快照，退出后新取景点才能看到已提交派发。
+
 ## 退役执行器对账（`reconcile.py`）
 
 执行器世代退役后，`job_attempts` 里可能还留着 `state='uncertain'` 的尝试：
@@ -229,6 +317,19 @@ finished, retryable = reconcile_epoch(
 `used_units` 恒等于已覆盖前缀真实和的不变量、拒绝时两张表均不变，以及
 全部入参的类型与边界校验。
 
+`test_dispatch.py` 同为纯标准库 + 真实临时 WAL 库，覆盖题述双租户专门化
+匹配（`[(11,102),(21,101)]` 而非顺序先发）、同数量分配的字典序取舍、未就绪
+/号位已占用/租户余量限制、低作业号插入与配额消耗导致的 stale、不支持种类和
+未涉及租户变更不 stale、回调内已回滚写入不 stale、容量 1 池中回调实际写入、
+第二份尝试写入失败后的整批回滚、故障移除后的同输入提交，以及快照读组的旧
+视图/退出后新视图；另含 300 组随机小图与暴力枚举一致性校验。
+
+运行全部回归：
+
+```sh
+python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile
+```
+
 `test_reconcile.py` 同为纯标准库 + 真实临时 WAL 库，覆盖：片段只补登/
 封存才重试、fence 精确匹配（旧令牌不能完成新尝试）、跨世代隔离、重放
 零改动、序号 1/1/3 冒充完整范围、同序号异内容、身份复用（含已归档
@@ -240,5 +341,5 @@ finished, retryable = reconcile_epoch(
 资源残留。运行：
 
 ```sh
-python3 -m unittest -v test_pool test_quota test_reconcile
+python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile
 ```
