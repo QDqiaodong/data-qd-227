@@ -152,6 +152,64 @@ with pool.borrow_snapshot_group(2, timeout=1) as readers:
 布尔值、非整数、越界或未知租户一律 `ValueError`，且在任何数据库改动
 之前抛出；SQLite/池错误不归入输入错误。
 
+## 退役执行器对账（`reconcile.py`）
+
+执行器世代退役后，`job_attempts` 里可能还留着 `state='uncertain'` 的尝试：
+终态回执也许已经写进执行器的顺序回执日志，只是没来得及回传。
+`reconcile_epoch(pool, epoch, receipts, *, sealed_count, scratch_dir)` 消费
+一次回执流，补登确有回执的结果；只有日志**完整性可证**时，才把没有终态
+回执的旧尝试交回 `retryable`。它修改的是真实调度资格，不执行作业，也不碰
+配额与回填规则。
+
+```python
+from reconcile import reconcile_epoch
+
+# 片段（sealed_count=None）：只补登命中的 uncertain 尝试，
+# 没有回执的行保持 uncertain，绝不据缺失发起重试。
+finished, retryable = reconcile_epoch(
+    pool, epoch, receipts_iter,
+    sealed_count=None, scratch_dir=Path(root) / "scratch")
+
+# 封存完整（sealed_count 为 0..120000 的整数）：有效结果必须恰好覆盖
+# 序号 1..sealed_count（允许精确重送）；未命中的旧尝试置 retryable。
+finished, retryable = reconcile_epoch(
+    pool, epoch, receipts_iter,
+    sealed_count=120000, scratch_dir=Path(root) / "scratch")
+# 返回值是本次实际改动的 (补登数, 置为可重试数)。
+```
+
+### 回执契约与校验
+
+- 每行是 `(seq, job_id, fence, outcome, payload)` 五元组，均属于入参世代；
+  `seq` 1..120000，`job_id`/`fence` 1..2147483647，必须是真正的整数
+  （布尔值不接受）；`outcome` 为 `"ok"`/`"failed"`；`payload` 是
+  1..1024 字节的 `bytes`，按原始字节落盘。单次调用最多消费 160000 行
+  （含重送）。
+- 同序号重送必须其余四项**逐字节/逐字符精确相同**，不能用摘要判定；同一
+  `(job_id, fence)` 不得绑定两个序号。即使对应尝试在库中已被覆盖或删除
+  （已归档身份），日志自身的冲突仍被拦截。
+- 参数/回执不合法、超上限、身份冲突均抛 `ValueError`；迭代器自身的异常
+  原样传播。封存声明与实际日志不一致（洞、越界、多余序号、计数不符）时
+  **整次拒绝**，不降级成片段，也不先补登其中的好行——任何输入失败都在
+  写事务之前发生，业务库零改动。
+
+### 两阶段与在线调度
+
+1. **准备阶段不占用业务池连接、不写业务库。** 只用一次极短的自动提交读
+   记下该世代对账开始时现存的尝试身份（最多 4096 行），随即归还连接；
+   之后把流落到 `scratch_dir` 中一个组件私有的临时 SQLite 库完成全部
+   校验，慢流不会堵住在线调度。落盘设计使 120000 条 ×1024 字节的乱序流
+   在 96 MiB 地址空间上限下也不需要进进程内存。
+2. **收尾单写事务借用现有池。** 只枚举该世代、事务内此刻仍为
+   `uncertain` 的当前行：回执的作业与 fence 同时精确匹配才置 `finished`
+   并写入 `outcome`/`receipt`；封存完整且身份在对账开始时就存在的未命中
+   旧尝试置 `retryable`（两列仍为 NULL）；片段未命中保持原状。流期间
+   正常完成、取消或换 fence 的在线提交不会被旧状态覆盖，重放返回零改动。
+   SQLite 失败整批回滚并传播。临时文件（含 WAL/回滚旁挂文件）在正常或
+   异常返回后都不残留；池只借用不关闭，也不另开业务库连接。
+3. `retryable` 只表示没有这次尝试的终态回执，不承诺作业外部副作用只
+   发生一次；不要求支持多个对账调用并发执行。
+
 ## 回归测试
 
 `test_pool.py` 仅依赖标准库，使用真实临时 WAL SQLite 库，覆盖：跨提交的
@@ -169,8 +227,18 @@ with pool.borrow_snapshot_group(2, timeout=1) as readers:
 同步点而非休眠）、SQLite 写失败的错误传播与额度保持、capacity=3 读组
 存活期间配额写实际提交且旧组旧视图/新组新视图、随机交错与多线程下
 `used_units` 恒等于已覆盖前缀真实和的不变量、拒绝时两张表均不变，以及
-全部入参的类型与边界校验。运行：
+全部入参的类型与边界校验。
+
+`test_reconcile.py` 同为纯标准库 + 真实临时 WAL 库，覆盖：片段只补登/
+封存才重试、fence 精确匹配（旧令牌不能完成新尝试）、跨世代隔离、重放
+零改动、序号 1/1/3 冒充完整范围、同序号异内容、身份复用（含已归档
+身份）、读取中断与各类参数越界的整次拒绝；流消费途中在线换 fence/结束
+尝试时只改仍合格的旧尝试、注入 SQLite 批量写失败整批回滚且池仍可用、
+双读快照组存活期间对账提交的旧视图/新组新视图；并在独立子进程
+`RLIMIT_AS=96 MiB` 下用单次迭代生成 120000 条乱序满规模回执（末尾精确
+重送、绝大多数身份已归档）验证补登/重试计数与正常、错误路径均无临时
+资源残留。运行：
 
 ```sh
-python3 -m unittest -v test_pool test_quota
+python3 -m unittest -v test_pool test_quota test_reconcile
 ```
