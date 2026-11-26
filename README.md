@@ -97,6 +97,135 @@ with pool.borrow_snapshot_group(2, timeout=1) as readers:
   代价；读组不额外复制数据，也无每读者私有临时库。
 - 组内查询从各自连接读取 WAL 索引，schema 缓存随连接复用而保留。
 
+## WAL 空间上限、回收准入与暂存快照（可选）
+
+长核对组钉住旧 WAL 读视图时，在线派发仍可提交，但旧视图会阻止
+`-wal` 被检查点缩短，日志可能持续涨大。`ConnectionPool` 增加两个**可选**
+构造参数处理这一风险：
+
+```python
+pool = ConnectionPool(
+    "dispatch.db",
+    capacity=3,
+    snapshot_groups=True,      # 启用上限必须同时启用同批读模式
+    wal_soft_limit=65536,      # 64 KiB；整数字节，65536..16777216，拒绝 bool
+    wal_scratch_dir="/var/lib/dispatch/wal-snap",  # 可选，须已存在且可写
+)
+```
+
+- 不传 `wal_soft_limit`（默认 `None`）时，原池、原同批读组、配额、对账、
+  派发与 demo 的行为完全不变，`reclaim_wal()` 抛 `ValueError`。
+- `wal_soft_limit` 必须是 `65536 <= n <= 16777216` 的严格整数（布尔值
+  不接受），且必须显式 `snapshot_groups=True`；`wal_scratch_dir` 不能在
+  未设上限时给出，且必须是**已存在、实际可创建临时文件**的目录。配置
+  非法一律在构造时抛 `ValueError`。
+
+### 写借用准入：什么时候暂缓写入
+
+判断压力只看**主库旁真实的 `<db>-wal` 文件字节数**（`os.path.getsize`，
+文件不存在按 0），不是待 checkpoint 的帧数；只把帧写回主库而文件没缩短，
+不算腾出空间。
+
+每个新的 `pool.borrow()` 写资格（快照模式下所有 `borrow` 都是互斥写资格）
+在即将发放时，于同一套池状态排序内重新取样：
+
+1. 发放时刻 WAL 长度 `< wal_soft_limit`：照常发放，不做额外动作。
+2. `>= wal_soft_limit`：池先在该写连接上实际执行
+   `PRAGMA wal_checkpoint(TRUNCATE)`（临时把该连接的 `busy_timeout` 调为 0，
+   绝不替调用方等待旧读组），再用**新的实测长度**确认；低于上限才发放。
+3. 仍 `>= wal_soft_limit`（通常是旧同批读组钉住 WAL，TRUNCATE 返回
+   busy）：抛出独立的 `pool.PoolWalPressure`（`RuntimeError` 子类，不是
+   `PoolTimeout`），**不交出连接、不等待旧组退出**。
+
+等待写资格的线程在被唤醒、真正取得发放资格后会重新走一遍上述判断，绝不
+沿用排队前的测量值。原来的池满、写资格等待、建组闸门与 `timeout` 语义
+不变；`PoolWalPressure` 是准入拒绝，不受 `timeout` 剩余时间影响（一旦轮
+到资格即立即判定）。
+
+上限只是**发放门槛，不是单笔事务的硬字节上限**：借用发放后，业务连接可以
+继续写入、提交、归还，哪怕正是这笔事务让 WAL 第一次越线；已成功的提交不
+撤销、不追溯失败（派发回调里已提交的大载荷会保留）。暂缓后不需要人工解
+锁：阻碍消失（读组退出）后，下一次 `borrow` 会自行 checkpoint、回收并
+继续。调度组件无需改造：`dispatch_wave` 的提交借用若被拒，
+`PoolWalPressure` 会原样穿出，候选、占用、配额总量与尝试均不会被该轮
+改动；读决策借用与 `before_commit` 中调用方自己的借用遵循同一准入。
+
+### `pool.reclaim_wal()`：值班程序的主动回收入口
+
+已启用上限的池提供：
+
+```python
+status, before_bytes, after_bytes = pool.reclaim_wal()
+```
+
+它主动尝试把 WAL 缩到 **0 字节**（文件不存在也视为 0）。前后字节数是在
+“本次维护决定”的保护（与写资格、建组互斥的同一池状态）下于尝试前后实测
+的值。返回状态只有三种：
+
+| status | 含义 | before/after |
+| --- | --- | --- |
+| `"reclaimed"` | 实测 WAL 已为 0；本来就无 WAL 时也返回它 | 无工作时为 `(0, 0)`；否则为 `(旧长度, 0)` |
+| `"lease_busy"` | 已有业务写连接借出（**含提交后仍未退出 `with` 块、以及归还时的 rollback 清理**），或读组尚在建立 | 只取样一次，两列填同一实测值；不尝试 checkpoint、不等待 |
+| `"reader_busy"` | 无写借用/建组，但已交付的旧读组（在单进程独占契约下这是唯一阻碍）使 TRUNCATE 无法缩短文件 | 尝试前后的**真实实测值**；不等待读组退出 |
+
+只有实测 `after_bytes == 0` 才报 `"reclaimed"`，绝不伪造回收成功。真实
+`sqlite3.Error` 或文件操作 `OSError` **原样传播**，不会被改写成 busy；
+失败会结清内部维护闸门与连接计数，池可立即继续使用。池 `close()` 后的
+调用抛 `PoolClosed`。
+
+运维上，这个入口适合：
+
+- 值班巡检/定时任务在低峰主动回收 WAL（例如每分钟一次，记录
+  `before/after/status` 做容量与阻塞来源监控）；
+- 收到 `PoolWalPressure` 告警后，人工或机器人调用它确认是
+  `lease_busy`（有长写事务/卡住的归还）还是 `reader_busy`（有长核对组），
+  前者查写者，后者推动核对作业结束或为池配置暂存目录；
+- 读组退出后立即手动回收一次，加速磁盘空间归还（不调用也没关系，下一
+  次写借用会自愈）。
+
+回收只使用池容量内的连接（优先复用空闲连接，否则在 `capacity` 名额内新
+开），与建组/维护所用的全部额外连接一样计入 `pool.open_connections`，池
+满时不会另开“旁路”连接。池不会直接删除 `-wal`、不会关闭读者、不会改变
+主库日志模式，也不会以下线整个池为代价腾空间。
+
+### 暂存目录：用一份快照换取“旧视图 + 可回收 WAL + 继续派发”
+
+默认（不给 `wal_scratch_dir`）时，已交付读组保留主库 WAL 读视图、**不
+创建任何副本**：阈值之下不会仅因存在读组就停写；越线且旧组阻碍回收时，
+新写入按上面的准入暂缓（`PoolWalPressure`），等组退出后自愈。
+
+提供 `wal_scratch_dir` 表示部署**允许**（但不被强制）用临时空间换取在线
+可用性。当前实现会在每次建组时，用 SQLite Online Backup API 从已钉住取
+景点的那一条主库连接，把该精确视图复制成暂存目录中**一个全组共享的
+`suffix` 唯一快照文件**（默认 rollback-journal 模式，避免再长 WAL/SHM
+旁挂），随后组内 `count` 条连接都打开这同一个快照文件。因此：
+
+- 组连接仍是普通的 `sqlite3.Connection`，晚到的第一条查询、跨语句重复查
+  询都只能读到取景时的已提交视图（快照文件对池私有且之后不可变）；
+- 读组不再钉住主库 WAL，`reclaim_wal()` 即使在组存活时也能真正
+  TRUNCATE 到 0，准入不再因该组暂缓，派发可在组内继续提交，而旧组照旧
+  读旧值；
+- 容量口径不变：1 条取源主连接（用完即归还复用）、备份目标连接与
+  `count` 条快照连接都计入 `capacity`，容量 3、count 2 时峰值仍为 3；
+- 每组在暂存目录至多一份共享快照（加 `-wal/-shm/-journal` 旁挂），
+  **含辅助文件总长度绝不超过 72 MiB**；超过即判失败并删除该快照、抛
+  `ValueError`。验收前提是主库逻辑大小 ≤ 64 MiB，一份紧凑快照加旁挂在
+  72 MiB 预算内；进程内不保留整库副本；
+- 正常退出、组体异常、建组失败都会删除本组快照文件（含已知旁挂后缀）；
+  `close()` 不撤销已交付组（快照连接关闭池后仍可查询），在关闭后最后一
+  个已交付组归还时同样清干净。池只删除自己用 `mkstemp` 建出的唯一文件及
+  其后缀，**调用方预先放在该目录的文件原样保留**。
+
+资源成本对照：
+
+| 方案 | 旧视图成本 | 越线时行为 |
+| --- | --- | --- |
+| 无暂存目录（默认） | 仅连接 + 被旧快照钉住而无法复用的 WAL 帧；磁盘成本是 WAL 增长，且有软上限兜底，不会无界 | 旧组阻碍 → 新写暂缓，组退出后自愈回收 |
+| 有暂存目录 | 每组额外一份 ≤ 主库大小的共享快照磁盘（预算 72 MiB），无进程内全库副本 | 主 WAL 可随时截断，派发继续，旧组读快照 |
+
+仍不处理池外连接、运行中 DDL、`ATTACH` 或调用方自行调整的会话 PRAGMA；
+这些前提下单进程、单池独占本地 WAL 主库。
+
 ## 租户占用索引与配额写入守卫（`quota.py`）
 
 `ReservationIndex(pool)` 复用同一个 `ConnectionPool`（不另开连接、不接管
@@ -327,8 +456,22 @@ finished, retryable = reconcile_epoch(
 运行全部回归：
 
 ```sh
-python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile
+python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile test_wal_pressure
 ```
+
+`test_wal_pressure.py` 同为纯标准库 + 真实临时 WAL 库，覆盖：构造参数
+与暂存目录校验；`reclaim_wal` 的 `reclaimed`/`lease_busy`/`reader_busy`
+三元组与实测前后字节；已提交但未归还的写借用仍判 `lease_busy`；归还后
+WAL 真正归零且数据可读；用 `_wait`/checkpoint 钩子做同步点，验证排队中的
+写借用取得资格后重新测量压力而不是沿用旧值；注入真实 SQLite 维护错误与
+取样 `OSError` 时原样传播且不留写借用/维护闸门；维护闸门与并发借用的排序；
+题述租户 1/2、候选 11/12/21、执行器 101/102 的无暂存目录完整场景（回调大
+载荷提交保留、双连接旧视图含晚到首查、`reader_busy`、派发抛
+`PoolWalPressure` 且四张表零改动、退组后不先维护直接重派得到
+`[(11,102),(21,101)]`、新组看到新尝试与大载荷）；以及带暂存目录的继续派
+发分支（一份共享快照、主 WAL 实际压低、旧组旧值、容量峰值 ≤3、暂存用量
+与 72 MiB 上限、预放文件保留、建快照/开快照连接失败与超预算清理、关闭后
+已交付组仍可查且归还后资源清零）。竞争全部用事件/钩子同步，不靠休眠。
 
 `test_reconcile.py` 同为纯标准库 + 真实临时 WAL 库，覆盖：片段只补登/
 封存才重试、fence 精确匹配（旧令牌不能完成新尝试）、跨世代隔离、重放
@@ -341,5 +484,5 @@ python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile
 资源残留。运行：
 
 ```sh
-python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile
+python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile test_wal_pressure
 ```
