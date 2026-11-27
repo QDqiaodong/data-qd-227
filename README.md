@@ -427,6 +427,109 @@ finished, retryable = reconcile_epoch(
 3. `retryable` 只表示没有这次尝试的终态回执，不承诺作业外部副作用只
    发生一次；不要求支持多个对账调用并发执行。
 
+## 执行监视器的活跃尝试名册（`projection.py`）
+
+调度器的执行监视器只关心**活跃尝试名册**：它按名单向执行器询问
+`state` 为 `dispatched` 或 `running` 的作业进度，不应继续询问已从活跃
+名单退出的尝试。本组件把这份名册以有界增量交接给**单个监视器**，无需反复
+读取整张 `job_attempts`。
+
+```python
+from projection import enable_projection, next_projection, ack_projection
+
+# 在线访问前启用一次；复用调用方已有的池，不关闭池、不另开业务库连接。
+enable_projection(pool, dirty_limit=64)
+
+# 监视器循环：拉取 -> 应用到本地名册 -> 确认
+while True:
+    ticket = next_projection(pool)
+    if ticket is None:
+        break  # 名册暂无新变化
+    number, kind, rows = ticket
+    if kind == "full":
+        roster = {job_id: entry for job_id, entry in rows}
+    else:  # "patch"
+        for job_id, entry in rows:
+            if entry is None:
+                roster.pop(job_id, None)   # 已退出活跃名单或已删除
+            else:
+                roster[job_id] = entry     # (epoch, fence, state)
+    ack_projection(pool, number)          # 仅应用后才确认
+```
+
+### 启用与参数
+
+- `enable_projection(pool, *, dirty_limit, overflow=None)`：建立内部状态
+  （`projection_state` / `projection_dirty` / `projection_ticket` /
+  `projection_ticket_rows` 四张组件私有表）与 `job_attempts` 上的触发器。
+  在启用在线访问前调用一次。`dirty_limit` 是 `2..4096` 的严格整数（布尔值
+  不接受）。重复调用、换池重开都保留已确认进度、待交接数据与票号；对已启用
+  库指定**不同**上限抛 `ValueError`，不支持在线改限额。
+- `overflow` 可选 `"defer"`（默认）或 `"commit"`，选择积压越线时的策略
+  （见下节）。省略时沿用已持久化的策略；对已启用库指定不同策略抛
+  `ValueError`。
+- `next_projection(pool)` / `ack_projection(pool, ticket)` 在未启用库上抛
+  `ValueError`。组件复用调用方的池，只借用；调用返回后不占着借用、SQL
+  游标或读视图。
+
+### 名册与交接语义
+
+- 名册只含 `dispatched` / `running` 的当前尝试；不确定、已结束、可重试或
+  其他状态一概不含。条目按 `job_id` 识别，内容是 `(epoch, fence, state)`；
+  重分配后若仍活跃，监视器改问当前世代与令牌，而不是旧尝试。
+- `next_projection` 返回 `None`（无新变化），或 `(ticket, kind, rows)`。
+  `ticket` 是单调递增、不复用的正整数；`rows` 是按作业号升序的
+  `(job_id, entry)` 列表。**首次**必须发 `kind="full"`（即使名册为空），
+  整份替换监视器内容；平时发 `kind="patch"`，只对变动过的作业给出取点上的
+  条目，届时已不活跃或已删除给 `entry=None`（监视器移除该作业）。每份数据
+  绑定单一已提交视图，不会交付一笔多作业派发的一半。
+- 一次只有一张未确认票。普通拉取或关池重开后的拉取都返回该票**原样内容**，
+  不填入取点之后的变化。监视器实际应用名册后才调用 `ack_projection`；只有
+  当前未确认票成功确认返回 `True`，其他合法票号返回 `False` 且不推进其他
+  票；非正整数的 `ticket`（含布尔值）抛 `ValueError`。
+- 一次取点最多 4096 个源表行；活跃名册超过 4096 行时无法作为单张票交付，
+  `next_projection` 抛 `ValueError`。
+
+### 变更记录与有界积压
+
+触发器在**同一业务事务**内记录恰好影响名册的变化：插入活跃状态、把活跃
+条目改成另一个 `(state, epoch, fence)`、删除活跃行。因此未提交操作不留痕、
+名单内容未变的更新（如只写 `outcome`）不记录、同一作业多次更新只占一项、
+回滚后整笔撤销。`projection_dirty` 至多保存 `dirty_limit` 个不同作业号；
+已交付但未确认的唯一一张票**另计**，其行落在票表，不占积压预算。
+
+增量发票只把有界脏集合按主键与新值连接成 `patch`，**从不扫描整张尝试
+表**；首次全量一次性包含此前的名册变化。不再活跃与删行都会进入脏集合
+（删除由 `DELETE` 触发器记下），不会只追踪新插入的活跃行。对账式、其他
+不改变活跃名册的业务写既不入脏集合，也不会被积压拦住。
+
+### 发布边界：积压越线时的两种策略
+
+若一笔上游写会让待制票的作业数超过 `dirty_limit`（验收前提：单笔写本身
+改变的不同作业数不超过上限），部署可选：
+
+- **`"defer"`（默认）**：暂缓这笔写。触发器以
+  `RAISE(ROLLBACK, 'projection_backlog')` 回滚**整笔事务**，Python 以
+  `sqlite3.IntegrityError` 抛出且消息含 `projection_backlog`；
+  `dispatch_wave` 已动过的候选、占用、配额总量与尝试全部回滚并原样上抛，
+  不会冒充 `stale`、也不吞别的 SQLite 错误。旧票确认、随后领取下一票腾出
+  积压后，原派发可重试。
+- **`"commit"`**：提交这笔写；在同一提交中把 `force_full` 置起，下一张新
+  票改发**完整活跃名册**、不再保留被取代的待制票增量。已发未确认票不会被
+  换掉——须先确认旧票，才能取得含此次写的新全量。新全量交付之后发生的
+  名册变化仍进入后续批次，不被该全量的确认抹掉。
+
+### 监视器应用、确认时机与对上游的影响
+
+- **应用**：收到 `"full"` 用整份替换本地名册；收到 `"patch"` 仅按行增删，
+  `entry=None` 删除。应用完成才确认票；在确认前再次拉取只会拿回同一张票。
+- **确认**：`ack_projection` 返回 `True` 表示当前票已结清；返回 `False`
+  （迟到确认、重复确认或非当前票号）不影响任何票。迟到确认不会推进新票。
+- **对上游**：积压满时，`"defer"` 让越线的上游写失败（`IntegrityError`）
+  并在监视器确认旧票、领取下一票后恢复；`"commit"` 让上游写照常提交，
+  代价是监视器下一次要接收完整名册。派发事务边界本身不变：仍先在池外求
+  匹配，再在一个 `BEGIN IMMEDIATE` 事务内复核并提交。
+
 ## 回归测试
 
 `test_pool.py` 仅依赖标准库，使用真实临时 WAL SQLite 库，覆盖：跨提交的
@@ -456,7 +559,7 @@ finished, retryable = reconcile_epoch(
 运行全部回归：
 
 ```sh
-python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile test_wal_pressure
+python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile test_wal_pressure test_projection
 ```
 
 `test_wal_pressure.py` 同为纯标准库 + 真实临时 WAL 库，覆盖：构造参数
@@ -481,8 +584,22 @@ WAL 真正归零且数据可读；用 `_wait`/checkpoint 钩子做同步点，�
 双读快照组存活期间对账提交的旧视图/新组新视图；并在独立子进程
 `RLIMIT_AS=96 MiB` 下用单次迭代生成 120000 条乱序满规模回执（末尾精确
 重送、绝大多数身份已归档）验证补登/重试计数与正常、错误路径均无临时
-资源残留。运行：
+资源残留。
+
+`test_projection.py` 同为纯标准库 + 真实临时 WAL 库，覆盖：启用前后两个
+交接入口、`dirty_limit` 边界与布尔/类型拒绝、`overflow` 非法值与在线改
+策略拒绝；换池重开保留票号/待交接数据/确认进度、不同上限抛
+`ValueError`；首次空全量、未确认票跨提交与跨重开原样返回、迟到确认返回
+`False` 且不推进新票；变更记录只计活跃名册变化、同一作业折叠、只改
+`outcome` 或已不活跃行不记录、回滚写入无痕、对账式写不被拦截；增量只按
+主键点查（大表上不扫描整张尝试表）、跨提交改状态与尝试身份加删行的增量；
+题述容量 1/上限 2 的两条越线分支（`defer` 整批回滚且 `dispatch_wave`
+原样抛 `projection_backlog`、确认旧票并领取增量后重试成功真正投递
+13/27；`commit` 提交后旧票不被改写、新全量含 13/27、全量未确认时活跃
+作业退出在确认后收到移除项），两条分支都用独立字典应用票并与实际库活跃
+行比对；无积压时真实 SQLite 拒绝第二条尝试写后仍收到原错误、四表不变、
+无幽灵票；4096 行走上界与超界拒绝；以及未启用时派发与建表行为不变。
 
 ```sh
-python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile test_wal_pressure
+python3 -m unittest -v test_pool test_quota test_dispatch test_reconcile test_wal_pressure test_projection
 ```
